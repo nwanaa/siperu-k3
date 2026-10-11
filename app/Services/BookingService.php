@@ -14,26 +14,33 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
 
-/**
- * Seluruh aturan antrean, deteksi bentrok, dan verifikasi ada di sini,
- * supaya form peminjam, halaman PJ, dan tes memakai logika yang sama.
- *
- * Konkurensi: setiap perubahan mengunci baris ruangan lebih dulu, sehingga
- * dua pengajuan/persetujuan ke ruangan yang sama selalu diproses bergantian.
- */
 class BookingService
 {
-    /** Peminjam mengajukan. Status Pending jika slot kosong, Antrean jika sudah ada yang menunggu. */
     public function submit(User $user, array $data, UploadedFile $letter): Booking
     {
-        $path = $letter->store('letters'); // disk privat, tidak bisa diakses lewat URL publik
+        $path = $letter->store('letters');
 
         try {
             $booking = DB::transaction(function () use ($user, $data, $path) {
-                $this->lockRoom((int) $data['room_id']);
+                $room = $this->lockRoom((int) $data['room_id']);
+
+                if ($room->trashed() || ! $room->is_active) {
+                    throw ValidationException::withMessages([
+                        'room_id' => 'Ruangan sudah tidak aktif atau tidak tersedia.',
+                    ]);
+                }
+
+                if ((int) $data['participants'] > (int) $room->capacity) {
+                    throw ValidationException::withMessages([
+                        'participants' => "Jumlah peserta melebihi kapasitas ruangan ({$room->capacity} orang).",
+                    ]);
+                }
 
                 $overlap = fn () => Booking::overlapping(
-                    (int) $data['room_id'], $data['date'], $data['start_time'], $data['end_time']
+                    $room->id,
+                    $data['date'],
+                    $data['start_time'],
+                    $data['end_time']
                 );
 
                 if ($overlap()->status(BookingStatus::Approved)->exists()) {
@@ -46,14 +53,16 @@ class BookingService
 
                 return Booking::create([
                     'user_id' => $user->id,
-                    'room_id' => $data['room_id'],
+                    'room_id' => $room->id,
                     'date' => $data['date'],
                     'start_time' => $data['start_time'],
                     'end_time' => $data['end_time'],
                     'participants' => $data['participants'],
                     'purpose' => $data['purpose'],
                     'letter_path' => $path,
-                    'status' => $taken ? BookingStatus::Queued : BookingStatus::Pending,
+                    'status' => $taken
+                        ? BookingStatus::Queued
+                        : BookingStatus::Pending,
                 ]);
             });
         } catch (\Throwable $e) {
@@ -61,22 +70,30 @@ class BookingService
             throw $e;
         }
 
-        $booking->load('room.pj', 'user');
+        $booking->load('room', 'user');
 
         if ($booking->status === BookingStatus::Queued) {
-            $this->notify($booking->user, $booking,
-                "Pengajuan {$booking->code} masuk antrean ke-{$booking->queue_position} karena ada pengajuan lain pada jam yang sama. Anda akan diberi tahu jika statusnya berubah.");
+            $this->notify(
+                $booking->user,
+                $booking,
+                "Pengajuan {$booking->code} masuk antrean ke-{$booking->queue_position} karena ada pengajuan lain pada jam yang sama. Anda akan diberi tahu jika statusnya berubah."
+            );
         } else {
-            $this->notify($booking->user, $booking,
-                "Pengajuan {$booking->code} berhasil dikirim dan menunggu verifikasi PJ.");
-            $this->notify($booking->room->pj, $booking,
-                "Pengajuan baru {$booking->code} dari {$booking->user->name} untuk {$booking->room->name} menunggu verifikasi Anda.");
+            $this->notify(
+                $booking->user,
+                $booking,
+                "Pengajuan {$booking->code} berhasil dikirim dan menunggu verifikasi PJ."
+            );
+
+            $this->notifyPjGroup(
+                $booking,
+                "Pengajuan baru {$booking->code} dari {$booking->user->name} untuk {$booking->room->name} menunggu verifikasi Anda."
+            );
         }
 
         return $booking;
     }
 
-    /** PJ menyetujui. Pengajuan lain yang bentrok otomatis ditolak. */
     public function approve(Booking $booking, User $pj, ?string $note = null): void
     {
         $this->authorizePj($booking, $pj);
@@ -84,10 +101,14 @@ class BookingService
         $autoRejected = DB::transaction(function () use ($booking, $pj, $note) {
             $this->lockRoom($booking->room_id);
             $booking->refresh();
-
             $this->ensureCanDecide($booking);
 
-            if ($this->overlapOf($booking)->status(BookingStatus::Approved)->where('id', '!=', $booking->id)->exists()) {
+            if (
+                $this->overlapOf($booking)
+                    ->status(BookingStatus::Approved)
+                    ->where('id', '!=', $booking->id)
+                    ->exists()
+            ) {
                 throw ValidationException::withMessages([
                     'booking' => 'Slot ini sudah disetujui untuk peminjam lain. Muat ulang halaman.',
                 ]);
@@ -108,6 +129,7 @@ class BookingService
             foreach ($others as $other) {
                 $other->update([
                     'status' => BookingStatus::Rejected,
+                    'verified_by' => $pj->id,
                     'verified_at' => now(),
                     'verification_note' => 'Otomatis ditolak: slot waktu telah disetujui untuk pengajuan lain.',
                 ]);
@@ -117,28 +139,38 @@ class BookingService
         });
 
         $booking->load('room', 'user');
-        $this->notify($booking->user, $booking, 'Pengajuan ' . $booking->code . ' DISETUJUI.' . ($note ? " Catatan PJ: {$note}" : ''));
+
+        $this->notify(
+            $booking->user,
+            $booking,
+            'Pengajuan ' . $booking->code . ' DISETUJUI.' .
+                ($note ? " Catatan PJ: {$note}" : '')
+        );
 
         foreach ($autoRejected as $other) {
             $other->load('room', 'user');
-            $this->notify($other->user, $other,
-                "Pengajuan {$other->code} tidak dapat diproses karena ruangan telah disetujui untuk pengajuan lain pada jam yang sama.");
+
+            $this->notify(
+                $other->user,
+                $other,
+                "Pengajuan {$other->code} tidak dapat diproses karena ruangan telah disetujui untuk pengajuan lain pada jam yang sama."
+            );
         }
     }
 
-    /** PJ menolak (catatan wajib). Antrean terdepan naik menjadi Pending. */
     public function reject(Booking $booking, User $pj, string $note): void
     {
         $this->authorizePj($booking, $pj);
 
         if (trim($note) === '') {
-            throw ValidationException::withMessages(['note' => 'Alasan penolakan wajib diisi.']);
+            throw ValidationException::withMessages([
+                'note' => 'Alasan penolakan wajib diisi.',
+            ]);
         }
 
         $promoted = DB::transaction(function () use ($booking, $pj, $note) {
             $this->lockRoom($booking->room_id);
             $booking->refresh();
-
             $this->ensureCanDecide($booking);
 
             $booking->update([
@@ -152,11 +184,16 @@ class BookingService
         });
 
         $booking->load('room', 'user');
-        $this->notify($booking->user, $booking, "Pengajuan {$booking->code} DITOLAK. Alasan: {$note}");
+
+        $this->notify(
+            $booking->user,
+            $booking,
+            "Pengajuan {$booking->code} DITOLAK. Alasan: {$note}"
+        );
+
         $this->notifyPromoted($promoted);
     }
 
-    /** Peminjam membatalkan pengajuannya sendiri selama masih Pending/Antrean. */
     public function cancel(Booking $booking, User $user): void
     {
         abort_unless($booking->user_id === $user->id, 403);
@@ -172,19 +209,22 @@ class BookingService
             }
 
             $wasPending = $booking->status === BookingStatus::Pending;
-            $booking->update(['status' => BookingStatus::Cancelled]);
 
-            return $wasPending ? $this->promoteQueued($booking) : collect();
+            $booking->update([
+                'status' => BookingStatus::Cancelled,
+            ]);
+
+            return $wasPending
+                ? $this->promoteQueued($booking)
+                : collect();
         });
 
         $this->notifyPromoted($promoted);
     }
 
-    // ------------------------------------------------------------------
-
     /**
-     * Setelah sebuah pengajuan Pending gugur, antrean di slot yang bertabrakan
-     * naik (urut waktu pengajuan) selama tidak ada Pending/Disetujui lain yang menghalangi.
+     * Promosikan satu pengajuan antrean yang tidak berbenturan
+     * dengan pengajuan Pending atau Approved lainnya.
      *
      * @return Collection<int, Booking>
      */
@@ -192,15 +232,28 @@ class BookingService
     {
         $promoted = collect();
 
-        foreach ($this->overlapOf($freed)->status(BookingStatus::Queued)->orderBy('id')->get() as $candidate) {
+        foreach (
+            $this->overlapOf($freed)
+                ->status(BookingStatus::Queued)
+                ->orderBy('created_at')
+                ->orderBy('id')
+                ->get() as $candidate
+        ) {
             $blocked = $this->overlapOf($candidate)
-                ->status(BookingStatus::Approved, BookingStatus::Pending)
+                ->status(
+                    BookingStatus::Approved,
+                    BookingStatus::Pending
+                )
                 ->where('id', '!=', $candidate->id)
                 ->exists();
 
             if (! $blocked) {
-                $candidate->update(['status' => BookingStatus::Pending]);
+                $candidate->update([
+                    'status' => BookingStatus::Pending,
+                ]);
+
                 $promoted->push($candidate);
+                break;
             }
         }
 
@@ -210,35 +263,50 @@ class BookingService
     private function notifyPromoted(Collection $promoted): void
     {
         foreach ($promoted as $booking) {
-            $booking->load('room.pj', 'user');
-            $this->notify($booking->user, $booking,
-                "Giliran Anda: pengajuan {$booking->code} kini berstatus Pending dan menunggu verifikasi PJ.");
-            $this->notify($booking->room->pj, $booking,
-                "Pengajuan {$booking->code} dari {$booking->user->name} menunggu verifikasi Anda.");
+            $booking->load('room', 'user');
+
+            $this->notify(
+                $booking->user,
+                $booking,
+                "Giliran Anda: pengajuan {$booking->code} kini berstatus Pending dan menunggu verifikasi PJ."
+            );
+
+            $this->notifyPjGroup(
+                $booking,
+                "Pengajuan {$booking->code} dari {$booking->user->name} menunggu verifikasi Anda."
+            );
         }
     }
 
-    private function overlapOf(Booking $b): Builder
+    private function overlapOf(Booking $booking): Builder
     {
         return Booking::overlapping(
-            $b->room_id,
-            $b->date->toDateString(),
-            substr($b->start_time, 0, 5),
-            substr($b->end_time, 0, 5),
+            $booking->room_id,
+            $booking->date->toDateString(),
+            substr((string) $booking->start_time, 0, 5),
+            substr((string) $booking->end_time, 0, 5)
         );
     }
 
-    private function lockRoom(int $roomId): void
+    private function lockRoom(int $roomId): Room
     {
-        Room::withTrashed()->whereKey($roomId)->lockForUpdate()->firstOrFail();
+        return Room::withTrashed()
+            ->whereKey($roomId)
+            ->lockForUpdate()
+            ->firstOrFail();
     }
 
     private function authorizePj(Booking $booking, User $pj): void
     {
+        $booking->loadMissing('room');
+
         abort_unless(
-            $pj->isPj() && $booking->room->pj_user_id === $pj->id,
+            $pj->isPj()
+                && $pj->pj_group
+                && $booking->room
+                && $booking->room->pj_group === $pj->pj_group,
             403,
-            'Anda bukan Penanggung Jawab ruangan ini.'
+            'Anda bukan Penanggung Jawab grup ruangan ini.'
         );
     }
 
@@ -251,13 +319,37 @@ class BookingService
         }
     }
 
-    /** Kegagalan notifikasi (mis. email) tidak boleh menggagalkan proses utama. */
-    private function notify(?User $to, Booking $booking, string $message): void
+    private function notifyPjGroup(Booking $booking, string $message): void
     {
+        $booking->loadMissing('room', 'user');
+
+        if (! $booking->room?->pj_group) {
+            return;
+        }
+
+        User::query()
+            ->where('role', User::PJ)
+            ->where('pj_group', $booking->room->pj_group)
+            ->where('is_active', true)
+            ->get()
+            ->each(function (User $pj) use ($booking, $message) {
+                $this->notify($pj, $booking, $message);
+            });
+    }
+
+    private function notify(
+        ?User $to,
+        Booking $booking,
+        string $message
+    ): void {
         if (! $to) {
             return;
         }
 
-        rescue(fn () => $to->notify(new BookingStatusUpdated($booking, $message)));
+        rescue(
+            fn () => $to->notify(
+                new BookingStatusUpdated($booking, $message)
+            )
+        );
     }
 }
