@@ -8,7 +8,7 @@
             'Jam'           => $booking->time_range,
             'Jumlah Peserta'=> $booking->participants . ' orang',
             'Keperluan'     => $booking->purpose,
-            'PJ Ruangan'    => $booking->room->pj?->name ?? '-',
+            'PJ Ruangan'    => $booking->room->pjGroupLabel(),
             'Diajukan'      => $booking->created_at->locale('id')->translatedFormat('d M Y, H:i'),
         ];
         $canCancel = in_array($booking->status, \App\Enums\BookingStatus::open(), true);

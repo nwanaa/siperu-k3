@@ -3,9 +3,9 @@
 
     $menus = match (true) {
         $u->isAdmin() => [
-            ['Dashboard',          'dashboard',        'home'],
-            ['Kelola Data',        'admin.data',       'database'],
-            ['Laporan Peminjaman', 'admin.reports',    'report'],
+            ['Dashboard',          'admin.dashboard',   'home'],
+            ['Kelola Pengguna',    'admin.users.index', 'database'],
+            ['Kelola Ruangan',     'admin.rooms.index', 'archive'],
         ],
         $u->isPj() => [
             ['Dashboard',          'dashboard',        'home'],

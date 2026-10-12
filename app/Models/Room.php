@@ -45,4 +45,16 @@ class Room extends Model
     {
         return $query->where('pj_group', $group);
     }
+
+    public function pjGroupLabel(): string
+    {
+        return match ($this->pj_group) {
+            'informatika' => 'Jurusan Informatika',
+            'sipil' => 'Jurusan Sipil',
+            'pwk' => 'Jurusan PWK',
+            'lab_ict' => 'Laboratorium ICT',
+            'lab_terpadu' => 'Laboratorium Terpadu',
+            default => '-',
+        };
+    }
 }
