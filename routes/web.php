@@ -11,7 +11,7 @@ use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Schedule;
 
 
-Route::redirect('/', '/login');
+Route::view('/', 'welcome')->name('landing');
 
 Schedule::command('siperu:sync-room-status')
     ->everyMinute()
