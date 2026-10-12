@@ -52,6 +52,21 @@ class Booking extends Model
         return $this->belongsTo(User::class, 'verified_by');
     }
 
+    public function verifier(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'verified_by');
+    }
+
+    public function getCodeAttribute(): string
+    {
+        return 'SP-' . str_pad((string) $this->id, 4, '0', STR_PAD_LEFT);
+    }
+
+    public function getTimeRangeAttribute(): string
+    {
+        return substr((string) $this->start_time, 0, 5) . ' - ' . substr((string) $this->end_time, 0, 5);
+    }
+
     public function scopeStatus($query, BookingStatus ...$statuses)
     {
         return $query->whereIn(
