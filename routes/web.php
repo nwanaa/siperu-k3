@@ -9,10 +9,10 @@ use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\ProfileController;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Schedule;
+use App\Http\Controllers\LandingController;
 
 
-Route::view('/', 'welcome')->name('landing');
-
+Route::get('/', [LandingController::class, 'index'])->name('landing');
 Schedule::command('siperu:sync-room-status')
     ->everyMinute()
     ->withoutOverlapping();
